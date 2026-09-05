@@ -52,6 +52,14 @@
 #define FW_CONTEXT_WATCHDOG_DISABLED (1u << 4)
 #define FW_CONTEXT_EXIT_GROUP_SENT   (1u << 5)
 
+#define FW_QUIESCE_SERVICE_CREATE_EVENT_EX (1u << 0)
+#define FW_QUIESCE_SERVICE_SIGNAL_EVENT    (1u << 1)
+#define FW_QUIESCE_SERVICE_CLOSE_EVENT     (1u << 2)
+
+#define FW_QUIESCE_RESULT_EVENT_CREATED    (1u << 0)
+#define FW_QUIESCE_RESULT_SIGNAL_SUCCEEDED (1u << 1)
+#define FW_QUIESCE_RESULT_CLOSE_SUCCEEDED  (1u << 2)
+
 #define FW_STAGE_NONE          0u
 #define FW_STAGE_BRIDGE_ALLOC  1u
 #define FW_STAGE_QUIESCE       2u
@@ -169,6 +177,11 @@ struct trfwc1_context {
     uint64_t bridge_stack_base_virtual;
     uint32_t bridge_stack_bytes;
     uint32_t page_table_pages;
+    uint64_t quiesce_create_status;
+    uint64_t quiesce_signal_status;
+    uint64_t quiesce_close_status;
+    uint32_t quiesce_service_flags;
+    uint32_t quiesce_result_flags;
 };
 #pragma pack(pop)
 
@@ -403,19 +416,65 @@ static bool trueos_collect_bridge_stack_pages(void) {
 #endif
 
 static bool trueos_signal_exit_boot_services_group(void) {
-    if (gBS == NULL || gBS->CreateEventEx == NULL || gBS->SignalEvent == NULL || gBS->CloseEvent == NULL) {
+    if (trueos_firmware_context != NULL) {
+        trueos_firmware_context->quiesce_create_status = (uint64_t)EFI_NOT_STARTED;
+        trueos_firmware_context->quiesce_signal_status = (uint64_t)EFI_NOT_STARTED;
+        trueos_firmware_context->quiesce_close_status = (uint64_t)EFI_NOT_STARTED;
+        trueos_firmware_context->quiesce_service_flags = 0;
+        trueos_firmware_context->quiesce_result_flags = 0;
+    }
+
+    if (gBS == NULL) {
+        return false;
+    }
+
+    uint32_t services = 0;
+    if (gBS->CreateEventEx != NULL) {
+        services |= FW_QUIESCE_SERVICE_CREATE_EVENT_EX;
+    }
+    if (gBS->SignalEvent != NULL) {
+        services |= FW_QUIESCE_SERVICE_SIGNAL_EVENT;
+    }
+    if (gBS->CloseEvent != NULL) {
+        services |= FW_QUIESCE_SERVICE_CLOSE_EVENT;
+    }
+    if (trueos_firmware_context != NULL) {
+        trueos_firmware_context->quiesce_service_flags = services;
+    }
+    if (services != (FW_QUIESCE_SERVICE_CREATE_EVENT_EX
+                   | FW_QUIESCE_SERVICE_SIGNAL_EVENT
+                   | FW_QUIESCE_SERVICE_CLOSE_EVENT)) {
         return false;
     }
 
     EFI_GUID group = TRUEOS_EXIT_BOOT_SERVICES_EVENT_GROUP_GUID;
     EFI_EVENT event = NULL;
     EFI_STATUS create = gBS->CreateEventEx(0, 0, NULL, NULL, &group, &event);
+    if (trueos_firmware_context != NULL) {
+        trueos_firmware_context->quiesce_create_status = (uint64_t)create;
+        if (!EFI_ERROR(create) && event != NULL) {
+            trueos_firmware_context->quiesce_result_flags |= FW_QUIESCE_RESULT_EVENT_CREATED;
+        }
+    }
     if (EFI_ERROR(create) || event == NULL) {
         return false;
     }
 
     EFI_STATUS signal = gBS->SignalEvent(event);
-    (void)gBS->CloseEvent(event);
+    if (trueos_firmware_context != NULL) {
+        trueos_firmware_context->quiesce_signal_status = (uint64_t)signal;
+        if (!EFI_ERROR(signal)) {
+            trueos_firmware_context->quiesce_result_flags |= FW_QUIESCE_RESULT_SIGNAL_SUCCEEDED;
+        }
+    }
+
+    EFI_STATUS close = gBS->CloseEvent(event);
+    if (trueos_firmware_context != NULL) {
+        trueos_firmware_context->quiesce_close_status = (uint64_t)close;
+        if (!EFI_ERROR(close)) {
+            trueos_firmware_context->quiesce_result_flags |= FW_QUIESCE_RESULT_CLOSE_SUCCEEDED;
+        }
+    }
 
     // SignalEvent success is the quiesce proof. CloseEvent only drops our
     // temporary event-group membership and must not undo an already delivered
@@ -1012,6 +1071,9 @@ bool trueos_hii_capture(void **out_address, size_t *out_size) {
         context.version = 1;
         context.bytes = sizeof(context);
         context.failure_stage = FW_STAGE_BRIDGE_ALLOC;
+        context.quiesce_create_status = (uint64_t)EFI_NOT_STARTED;
+        context.quiesce_signal_status = (uint64_t)EFI_NOT_STARTED;
+        context.quiesce_close_status = (uint64_t)EFI_NOT_STARTED;
         memcpy((uint8_t *)payload + context_offset, &context, sizeof(context));
 
         size_t context_entry_index = entry_index;
