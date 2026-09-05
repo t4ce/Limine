@@ -407,8 +407,9 @@ static bool trueos_collect_bridge_stack_pages(void) {
 }
 #endif
 
-static bool trueos_disconnect_all_pci_controllers(void) {
+static bool trueos_disconnect_trueos_pci_controllers(void) {
     if (gBS == NULL || gBS->LocateHandleBuffer == NULL
+     || gBS->HandleProtocol == NULL || gBS->AllocatePool == NULL
      || gBS->DisconnectController == NULL || gBS->FreePool == NULL) {
         return false;
     }
@@ -425,15 +426,105 @@ static bool trueos_disconnect_all_pci_controllers(void) {
         return false;
     }
 
-    bool ok = true;
+    EFI_HANDLE *targets = NULL;
+    status = gBS->AllocatePool(
+        EfiLoaderData,
+        handle_count * sizeof(EFI_HANDLE),
+        (void **)&targets
+    );
+    if (EFI_ERROR(status) || targets == NULL) {
+        (void)gBS->FreePool(handles);
+        return false;
+    }
+
+    UINTN target_count = 0;
+    UINTN network_count = 0;
+    UINTN xhci_count = 0;
+
     for (UINTN i = 0; i < handle_count; i++) {
-        status = gBS->DisconnectController(handles[i], NULL, NULL);
-        if (EFI_ERROR(status) && status != EFI_INVALID_PARAMETER) {
+        EFI_PCI_IO_PROTOCOL *pci = NULL;
+        status = gBS->HandleProtocol(
+            handles[i],
+            &pci_io,
+            (void **)&pci
+        );
+        if (EFI_ERROR(status) || pci == NULL || pci->Pci.Read == NULL) {
+            continue;
+        }
+
+        uint32_t class_reg = 0;
+        status = pci->Pci.Read(
+            pci,
+            EfiPciIoWidthUint32,
+            0x08,
+            1,
+            &class_reg
+        );
+        if (EFI_ERROR(status)) {
+            continue;
+        }
+
+        uint8_t prog_if = (uint8_t)(class_reg >> 8);
+        uint8_t subclass = (uint8_t)(class_reg >> 16);
+        uint8_t base_class = (uint8_t)(class_reg >> 24);
+
+        bool is_network = base_class == 0x02;
+        bool is_xhci = false;
+
+        if (base_class == 0x0c && subclass == 0x03 && prog_if == 0x30
+         && pci->GetLocation != NULL) {
+            UINTN segment = 0;
+            UINTN bus = 0;
+            UINTN device = 0;
+            UINTN function = 0;
+
+            status = pci->GetLocation(
+                pci,
+                &segment,
+                &bus,
+                &device,
+                &function
+            );
+            if (!EFI_ERROR(status)
+             && segment == 0
+             && bus == 0
+             && device == 0x14
+             && function == 0) {
+                is_xhci = true;
+            }
+        }
+
+        if (!is_network && !is_xhci) {
+            continue;
+        }
+
+        targets[target_count++] = handles[i];
+        if (is_network) {
+            network_count++;
+        }
+        if (is_xhci) {
+            xhci_count++;
+        }
+    }
+
+    (void)gBS->FreePool(handles);
+
+    // This board is expected to expose exactly two PCI network controllers
+    // plus the Intel xHCI controller at 0000:00:14.0.
+    if (network_count != 2 || xhci_count != 1) {
+        (void)gBS->FreePool(targets);
+        return false;
+    }
+
+    bool ok = true;
+    for (UINTN i = 0; i < target_count; i++) {
+        status = gBS->DisconnectController(targets[i], NULL, NULL);
+        if (EFI_ERROR(status)) {
             ok = false;
         }
     }
 
-    if (EFI_ERROR(gBS->FreePool(handles))) {
+    if (EFI_ERROR(gBS->FreePool(targets))) {
         ok = false;
     }
     return ok;
@@ -541,7 +632,7 @@ static bool trueos_prepare_firmware_quiesce(void) {
         trueos_watchdog_disabled = !EFI_ERROR(watchdog);
     }
 
-    if (!trueos_disconnect_all_pci_controllers()) {
+    if (!trueos_disconnect_trueos_pci_controllers()) {
         return false;
     }
 
