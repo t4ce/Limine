@@ -89,7 +89,12 @@ Miscellaneous:
   `0.25` are accepted, and the timeout is capped at `9999` seconds. If set to
   `no`, disable automatic boot. If set to `0`, boot the selected entry
   instantly, without showing the menu. A value that is neither `no` nor a
-  number is treated as `0`.
+  number is treated as `0`. On UEFI, the Boot Loader Interface's
+  `LoaderConfigTimeoutOneShot` EFI variable, where set (for example by
+  `systemctl reboot --boot-loader-menu=`), overrides this option for the boot
+  that consumes it, and the persistent `LoaderConfigTimeout` variable (for
+  example from `bootctl set-timeout`) is honoured only where this option is
+  not set.
 * `quiet` - If set to `yes`, enable quiet mode, where all screen output except
   panics and important warnings is suppressed. If `timeout` is not 0, the
   `timeout` still occurs, and pressing any key during the timeout will reveal
@@ -109,7 +114,11 @@ Miscellaneous:
   `/`, `\`, and `#` characters in entry names must be escaped as `\/`, `\\`,
   and `\#` respectively. If multiple sibling entries share the same name, append
   `#N` to select the Nth duplicate (e.g. `Arch Linux#1` for the second entry
-  named `Arch Linux`). If unspecified, it is `1`.
+  named `Arch Linux`). If unspecified, it is `1`. On UEFI, a Boot Loader
+  Interface `LoaderEntryOneShot` request overrides this option for the boot
+  that consumes it, and `remember_last_entry` and the persistent
+  `LoaderEntryDefault` variable are consulted, in that order, only where this
+  option is not set.
 * `remember_last_entry` - If set to `yes`, remember last booted entry.
   (UEFI only).
 * `graphics` - If set to `no`, force text mode for the boot menu, else use
@@ -124,6 +133,9 @@ Miscellaneous:
   image, in RRGGBB format.
 * `verbose` - If set to `yes`, print additional information during boot.
   Defaults to not verbose.
+* `terse` - If set to `yes`, suppress informational loading messages (such as
+  "Loading kernel" and "Loading module") when booting any entry. The menu and
+  any error or panic messages remain unaffected. Defaults to `no`.
 * `randomise_memory` - If set to `yes`, randomise the contents of RAM at bootup
   in order to find bugs related to non zeroed memory or for security reasons.
   This option will slow down boot time significantly. In the case of IA-32,

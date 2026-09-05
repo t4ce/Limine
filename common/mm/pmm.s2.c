@@ -147,7 +147,13 @@ void pmm_sanitise_entries(struct memmap_entry *m, size_t *_count, bool align_ent
             uint64_t res_length = m[j].length;
             uint64_t res_top    = CHECKED_ADD(res_base, res_length, continue);
 
-            // Non-usable entry fully contains usable entry
+            // An empty entry overlaps nothing: split against one, a usable
+            // entry reproduces itself and the walk never settles.
+            if (res_length == 0) {
+                continue;
+            }
+
+            // Another entry fully contains the usable entry
             if (res_base <= base && res_top >= top) {
                 m[i].base   = top;
                 m[i].length = 0;
@@ -156,8 +162,16 @@ void pmm_sanitise_entries(struct memmap_entry *m, size_t *_count, bool align_ent
 
             if ( (res_base >= base && res_base < top)
               && (res_top  >= base && res_top  < top) ) {
-                // TODO actually handle splitting off usable chunks
-                panic(false, "A non-usable memory map entry is inside a usable section.");
+                if (count >= memmap_max_entries) {
+                    panic(false, "Memory map exhausted.");
+                }
+
+                m[count] = m[i];
+                m[count].base = res_top;
+                m[count].length = top - res_top;
+                count++;
+
+                top = res_base;
             }
 
             if (res_base >= base && res_base < top) {
@@ -221,10 +235,12 @@ del_mm1:
         m[p] = min_e;
     }
 
-    // Merge contiguous bootloader-reclaimable, reserved (mapped), usable entries
+    // Merge contiguous bootloader-reclaimable, reserved (mapped),
+    // kernel/modules, usable entries
     for (size_t i = 0; i + 1 < count; i++) {
         if (m[i].type != MEMMAP_BOOTLOADER_RECLAIMABLE
          && m[i].type != MEMMAP_RESERVED_MAPPED
+         && m[i].type != MEMMAP_KERNEL_AND_MODULES
          && m[i].type != MEMMAP_USABLE)
             continue;
 
