@@ -52,6 +52,20 @@
 #define FW_CONTEXT_WATCHDOG_DISABLED (1u << 4)
 #define FW_CONTEXT_EXIT_GROUP_SENT   (1u << 5)
 
+#define FW_QUIESCE_SERVICE_CREATE_EVENT_EX (1u << 0)
+#define FW_QUIESCE_SERVICE_SIGNAL_EVENT    (1u << 1)
+#define FW_QUIESCE_SERVICE_CLOSE_EVENT     (1u << 2)
+
+#define FW_QUIESCE_RESULT_EVENT_CREATED    (1u << 0)
+#define FW_QUIESCE_RESULT_SIGNAL_SUCCEEDED (1u << 1)
+#define FW_QUIESCE_RESULT_CLOSE_SUCCEEDED  (1u << 2)
+#define FW_QUIESCE_RESULT_COMPAT_EVENT     (1u << 3)
+
+// UEFI-defined values. Keep local names so this experiment does not depend on
+// a particular picoefi header spelling for the compatibility retry.
+#define TRUEOS_EVT_NOTIFY_SIGNAL 0x00000200u
+#define TRUEOS_TPL_CALLBACK      8u
+
 #define FW_STAGE_NONE          0u
 #define FW_STAGE_BRIDGE_ALLOC  1u
 #define FW_STAGE_QUIESCE       2u
@@ -64,8 +78,8 @@
     { 0xef9fc172, 0xa1b2, 0x4693, { 0xb3, 0x27, 0x6d, 0x32, 0xfc, 0x41, 0x60, 0x42 } }
 #define TRUEOS_HII_CONFIG_ROUTING_PROTOCOL_GUID \
     { 0x587e72d7, 0xcc50, 0x4f79, { 0x82, 0x09, 0xca, 0x29, 0x1f, 0xc1, 0xa1, 0x0f } }
-#define TRUEOS_PCI_IO_PROTOCOL_GUID \
-    { 0x4cf5b200, 0x68b8, 0x4ca5, { 0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a } }
+#define TRUEOS_EXIT_BOOT_SERVICES_EVENT_GROUP_GUID \
+    { 0x27abf055, 0xb1b8, 0x4c26, { 0x80, 0x48, 0x74, 0x8f, 0x37, 0xba, 0xa2, 0xdf } }
 
 #define PT_PRESENT ((uint64_t)1 << 0)
 #define PT_HUGE    ((uint64_t)1 << 7)
@@ -407,132 +421,12 @@ static bool trueos_collect_bridge_stack_pages(void) {
 }
 #endif
 
-static bool trueos_disconnect_trueos_pci_controllers(void) {
-    if (gBS == NULL || gBS->LocateHandleBuffer == NULL
-     || gBS->HandleProtocol == NULL || gBS->AllocatePool == NULL
-     || gBS->DisconnectController == NULL || gBS->FreePool == NULL) {
-        return false;
-    }
-
-    EFI_GUID pci_io = TRUEOS_PCI_IO_PROTOCOL_GUID;
-    EFI_HANDLE *handles = NULL;
-    UINTN handle_count = 0;
-    EFI_STATUS status = gBS->LocateHandleBuffer(
-        ByProtocol, &pci_io, NULL, &handle_count, &handles);
-    if (EFI_ERROR(status) || handles == NULL || handle_count == 0) {
-        if (handles != NULL) {
-            (void)gBS->FreePool(handles);
-        }
-        return false;
-    }
-
-    EFI_HANDLE *targets = NULL;
-    status = gBS->AllocatePool(
-        EfiLoaderData,
-        handle_count * sizeof(EFI_HANDLE),
-        (void **)&targets
-    );
-    if (EFI_ERROR(status) || targets == NULL) {
-        (void)gBS->FreePool(handles);
-        return false;
-    }
-
-    UINTN target_count = 0;
-    UINTN network_count = 0;
-    UINTN xhci_count = 0;
-
-    for (UINTN i = 0; i < handle_count; i++) {
-        EFI_PCI_IO_PROTOCOL *pci = NULL;
-        status = gBS->HandleProtocol(
-            handles[i],
-            &pci_io,
-            (void **)&pci
-        );
-        if (EFI_ERROR(status) || pci == NULL || pci->Pci.Read == NULL) {
-            continue;
-        }
-
-        uint32_t class_reg = 0;
-        status = pci->Pci.Read(
-            pci,
-            EfiPciIoWidthUint32,
-            0x08,
-            1,
-            &class_reg
-        );
-        if (EFI_ERROR(status)) {
-            continue;
-        }
-
-        uint8_t prog_if = (uint8_t)(class_reg >> 8);
-        uint8_t subclass = (uint8_t)(class_reg >> 16);
-        uint8_t base_class = (uint8_t)(class_reg >> 24);
-
-        bool is_network = base_class == 0x02;
-        bool is_xhci = false;
-
-        if (base_class == 0x0c && subclass == 0x03 && prog_if == 0x30
-         && pci->GetLocation != NULL) {
-            UINTN segment = 0;
-            UINTN bus = 0;
-            UINTN device = 0;
-            UINTN function = 0;
-
-            status = pci->GetLocation(
-                pci,
-                &segment,
-                &bus,
-                &device,
-                &function
-            );
-            if (!EFI_ERROR(status)
-             && segment == 0
-             && bus == 0
-             && device == 0x14
-             && function == 0) {
-                is_xhci = true;
-            }
-        }
-
-        if (!is_network && !is_xhci) {
-            continue;
-        }
-
-        targets[target_count++] = handles[i];
-        if (is_network) {
-            network_count++;
-        }
-        if (is_xhci) {
-            xhci_count++;
-        }
-    }
-
-    (void)gBS->FreePool(handles);
-
-    // This board is expected to expose exactly two PCI network controllers
-    // plus the Intel xHCI controller at 0000:00:14.0.
-    if (network_count != 2 || xhci_count != 1) {
-        (void)gBS->FreePool(targets);
-        return false;
-    }
-
-    bool ok = true;
-    for (UINTN i = 0; i < target_count; i++) {
-        status = gBS->DisconnectController(targets[i], NULL, NULL);
-        if (EFI_ERROR(status)) {
-            ok = false;
-        }
-    }
-
-    if (EFI_ERROR(gBS->FreePool(targets))) {
-        ok = false;
-    }
-    return ok;
+static void EFIAPI trueos_quiesce_noop_notify(EFI_EVENT event, void *context) {
+    (void)event;
+    (void)context;
 }
 
-/* Legacy event-group signaling path retained as reference during PCI
- * controller quiesce bring-up; the active path above disconnects PCI first.
- *
+static bool trueos_signal_exit_boot_services_group(void) {
     if (trueos_firmware_context != NULL) {
         trueos_firmware_context->quiesce_create_status = (uint64_t)EFI_NOT_STARTED;
         trueos_firmware_context->quiesce_signal_status = (uint64_t)EFI_NOT_STARTED;
@@ -619,7 +513,6 @@ static bool trueos_disconnect_trueos_pci_controllers(void) {
     // ExitBootServices notification.
     return !EFI_ERROR(signal);
 }
- */
 
 static bool trueos_prepare_firmware_quiesce(void) {
     if (trueos_quiesce_completed) {
@@ -632,7 +525,8 @@ static bool trueos_prepare_firmware_quiesce(void) {
         trueos_watchdog_disabled = !EFI_ERROR(watchdog);
     }
 
-    if (!trueos_disconnect_trueos_pci_controllers()) {
+    trueos_exit_group_signalled = trueos_signal_exit_boot_services_group();
+    if (!trueos_exit_group_signalled) {
         return false;
     }
 
