@@ -52,20 +52,6 @@
 #define FW_CONTEXT_WATCHDOG_DISABLED (1u << 4)
 #define FW_CONTEXT_EXIT_GROUP_SENT   (1u << 5)
 
-#define FW_QUIESCE_SERVICE_CREATE_EVENT_EX (1u << 0)
-#define FW_QUIESCE_SERVICE_SIGNAL_EVENT    (1u << 1)
-#define FW_QUIESCE_SERVICE_CLOSE_EVENT     (1u << 2)
-
-#define FW_QUIESCE_RESULT_EVENT_CREATED    (1u << 0)
-#define FW_QUIESCE_RESULT_SIGNAL_SUCCEEDED (1u << 1)
-#define FW_QUIESCE_RESULT_CLOSE_SUCCEEDED  (1u << 2)
-#define FW_QUIESCE_RESULT_COMPAT_EVENT     (1u << 3)
-
-// UEFI-defined values. Keep local names so this experiment does not depend on
-// a particular picoefi header spelling for the compatibility retry.
-#define TRUEOS_EVT_NOTIFY_SIGNAL 0x00000200u
-#define TRUEOS_TPL_CALLBACK      8u
-
 #define FW_STAGE_NONE          0u
 #define FW_STAGE_BRIDGE_ALLOC  1u
 #define FW_STAGE_QUIESCE       2u
@@ -78,8 +64,8 @@
     { 0xef9fc172, 0xa1b2, 0x4693, { 0xb3, 0x27, 0x6d, 0x32, 0xfc, 0x41, 0x60, 0x42 } }
 #define TRUEOS_HII_CONFIG_ROUTING_PROTOCOL_GUID \
     { 0x587e72d7, 0xcc50, 0x4f79, { 0x82, 0x09, 0xca, 0x29, 0x1f, 0xc1, 0xa1, 0x0f } }
-#define TRUEOS_EXIT_BOOT_SERVICES_EVENT_GROUP_GUID \
-    { 0x27abf055, 0xb1b8, 0x4c26, { 0x80, 0x48, 0x74, 0x8f, 0x37, 0xba, 0xa2, 0xdf } }
+#define TRUEOS_PCI_IO_PROTOCOL_GUID \
+    { 0x4cf5b200, 0x68b8, 0x4ca5, { 0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a } }
 
 #define PT_PRESENT ((uint64_t)1 << 0)
 #define PT_HUGE    ((uint64_t)1 << 7)
@@ -421,12 +407,41 @@ static bool trueos_collect_bridge_stack_pages(void) {
 }
 #endif
 
-static void EFIAPI trueos_quiesce_noop_notify(EFI_EVENT event, void *context) {
-    (void)event;
-    (void)context;
+static bool trueos_disconnect_all_pci_controllers(void) {
+    if (gBS == NULL || gBS->LocateHandleBuffer == NULL
+     || gBS->DisconnectController == NULL || gBS->FreePool == NULL) {
+        return false;
+    }
+
+    EFI_GUID pci_io = TRUEOS_PCI_IO_PROTOCOL_GUID;
+    EFI_HANDLE *handles = NULL;
+    UINTN handle_count = 0;
+    EFI_STATUS status = gBS->LocateHandleBuffer(
+        ByProtocol, &pci_io, NULL, &handle_count, &handles);
+    if (EFI_ERROR(status) || handles == NULL || handle_count == 0) {
+        if (handles != NULL) {
+            (void)gBS->FreePool(handles);
+        }
+        return false;
+    }
+
+    bool ok = true;
+    for (UINTN i = 0; i < handle_count; i++) {
+        status = gBS->DisconnectController(handles[i], NULL, NULL);
+        if (EFI_ERROR(status) && status != EFI_INVALID_PARAMETER) {
+            ok = false;
+        }
+    }
+
+    if (EFI_ERROR(gBS->FreePool(handles))) {
+        ok = false;
+    }
+    return ok;
 }
 
-static bool trueos_signal_exit_boot_services_group(void) {
+/* Legacy event-group signaling path retained as reference during PCI
+ * controller quiesce bring-up; the active path above disconnects PCI first.
+ *
     if (trueos_firmware_context != NULL) {
         trueos_firmware_context->quiesce_create_status = (uint64_t)EFI_NOT_STARTED;
         trueos_firmware_context->quiesce_signal_status = (uint64_t)EFI_NOT_STARTED;
@@ -513,6 +528,7 @@ static bool trueos_signal_exit_boot_services_group(void) {
     // ExitBootServices notification.
     return !EFI_ERROR(signal);
 }
+ */
 
 static bool trueos_prepare_firmware_quiesce(void) {
     if (trueos_quiesce_completed) {
@@ -525,8 +541,7 @@ static bool trueos_prepare_firmware_quiesce(void) {
         trueos_watchdog_disabled = !EFI_ERROR(watchdog);
     }
 
-    trueos_exit_group_signalled = trueos_signal_exit_boot_services_group();
-    if (!trueos_exit_group_signalled) {
+    if (!trueos_disconnect_all_pci_controllers()) {
         return false;
     }
 
