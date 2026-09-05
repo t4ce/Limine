@@ -59,6 +59,12 @@
 #define FW_QUIESCE_RESULT_EVENT_CREATED    (1u << 0)
 #define FW_QUIESCE_RESULT_SIGNAL_SUCCEEDED (1u << 1)
 #define FW_QUIESCE_RESULT_CLOSE_SUCCEEDED  (1u << 2)
+#define FW_QUIESCE_RESULT_COMPAT_EVENT     (1u << 3)
+
+// UEFI-defined values. Keep local names so this experiment does not depend on
+// a particular picoefi header spelling for the compatibility retry.
+#define TRUEOS_EVT_NOTIFY_SIGNAL 0x00000200u
+#define TRUEOS_TPL_CALLBACK      8u
 
 #define FW_STAGE_NONE          0u
 #define FW_STAGE_BRIDGE_ALLOC  1u
@@ -415,6 +421,11 @@ static bool trueos_collect_bridge_stack_pages(void) {
 }
 #endif
 
+static void EFIAPI trueos_quiesce_noop_notify(EFI_EVENT event, void *context) {
+    (void)event;
+    (void)context;
+}
+
 static bool trueos_signal_exit_boot_services_group(void) {
     if (trueos_firmware_context != NULL) {
         trueos_firmware_context->quiesce_create_status = (uint64_t)EFI_NOT_STARTED;
@@ -450,6 +461,27 @@ static bool trueos_signal_exit_boot_services_group(void) {
     EFI_GUID group = TRUEOS_EXIT_BOOT_SERVICES_EVENT_GROUP_GUID;
     EFI_EVENT event = NULL;
     EFI_STATUS create = gBS->CreateEventEx(0, 0, NULL, NULL, &group, &event);
+
+    // UEFI explicitly permits Type=0/NotifyFunction=NULL for the temporary
+    // member used to signal an event group. This board nevertheless returns
+    // EFI_INVALID_PARAMETER for that form. Retry with an ordinary
+    // EVT_NOTIFY_SIGNAL member and a no-op callback; signalling any member of
+    // the group still signals every existing EXIT_BOOT_SERVICES group member.
+    if (create == EFI_INVALID_PARAMETER) {
+        event = NULL;
+        if (trueos_firmware_context != NULL) {
+            trueos_firmware_context->quiesce_result_flags |= FW_QUIESCE_RESULT_COMPAT_EVENT;
+        }
+        create = gBS->CreateEventEx(
+            TRUEOS_EVT_NOTIFY_SIGNAL,
+            TRUEOS_TPL_CALLBACK,
+            trueos_quiesce_noop_notify,
+            NULL,
+            &group,
+            &event
+        );
+    }
+
     if (trueos_firmware_context != NULL) {
         trueos_firmware_context->quiesce_create_status = (uint64_t)create;
         if (!EFI_ERROR(create) && event != NULL) {
