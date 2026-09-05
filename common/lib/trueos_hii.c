@@ -415,8 +415,12 @@ static bool trueos_signal_exit_boot_services_group(void) {
     }
 
     EFI_STATUS signal = gBS->SignalEvent(event);
-    EFI_STATUS close = gBS->CloseEvent(event);
-    return !EFI_ERROR(signal) && !EFI_ERROR(close);
+    (void)gBS->CloseEvent(event);
+
+    // SignalEvent success is the quiesce proof. CloseEvent only drops our
+    // temporary event-group membership and must not undo an already delivered
+    // ExitBootServices notification.
+    return !EFI_ERROR(signal);
 }
 
 static bool trueos_prepare_firmware_quiesce(void) {
